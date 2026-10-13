@@ -1,0 +1,5 @@
+# cmd.exe and Windows PowerShell expect Windows line endings
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.md  text eol=crlf
+LICENSE text eol=crlf
