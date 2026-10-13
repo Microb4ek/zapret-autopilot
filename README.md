@@ -1,9 +1,9 @@
 # ZAPRET AUTOPILOT
 
+**Русский** | [English](README.en.md)
+
 Программа сама ставит, чинит, настраивает и включает [zapret от Flowseal](https://github.com/Flowseal/zapret-discord-youtube),
 чтобы работали Discord и YouTube.
-
-*One-click installer and auto-tuner for Flowseal's zapret-discord-youtube on Windows: installs or repairs zapret, tests every strategy, enables the best one and sets it to start with Windows. The interface is in Russian.*
 
 ### [⬇ Скачать zapret-autopilot.zip](https://github.com/Microb4ek/zapret-autopilot/releases/latest/download/zapret-autopilot.zip)
 
@@ -88,9 +88,10 @@
 
 1. **Подготовка.** Останавливается текущий обход; служба `zapret` (service.bat → Install Service) удаляется.
 2. **Диагностика.** Те же проверки, что service.bat → Run Diagnostics, но без вопросов.
-   Включаются TCP timestamps, запускается BFE, удаляются зависшая служба WinDivert и конфликтующие обходы, кэш Discord чистится.
+   Включаются TCP timestamps, запускается BFE, удаляется зависшая служба WinDivert.
+   Конфликтующие обходы удаляются и кэш Discord чистится, если это включено в настройках.
 3. **Тесты.** Запускается родной `utils\test zapret.ps1` в режиме Standard → All configs.
-4. **Выбор.** Стратегия считается рабочей, если на ней открываются все адреса из `utils\targets.txt`: Discord, YouTube, Google, Cloudflare.
+4. **Выбор.** Стратегия считается рабочей, если на ней открываются все адреса обязательных сервисов из `utils\targets.txt` (по умолчанию всех: Discord, YouTube, Google, Cloudflare).
    Из нескольких рабочих выбирается та, у которой больше успешных запросов.
 5. **Запуск** лучшей стратегии (свёрнуто) и автозапуск через задачу планировщика `zapret-autopilot`. Задача срабатывает при входе в Windows, с правами администратора.
 
