@@ -4,6 +4,7 @@
 ::   zapret-autopilot.bat            - simple screen (first run: find/install, repair, tune, enable)
 ::   zapret-autopilot.bat auto       - do everything without questions
 ::   zapret-autopilot.bat menu       - advanced menu
+::   zapret-autopilot.bat settings   - settings (AUTO/manual mode, install folder, shortcuts...)
 ::   zapret-autopilot.bat cycle      - diagnostics -> tests -> start best (update zapret if nothing works)
 ::   zapret-autopilot.bat start      - start remembered best strategy
 ::   zapret-autopilot.bat stop       - stop winws

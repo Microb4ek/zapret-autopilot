@@ -4,7 +4,7 @@
 # установка на чистый компьютер / починка -> диагностика -> тест всех стратегий -> запуск лучшей -> автозапуск,
 # а если ни одна стратегия не открывает все сервисы — чистая переустановка zapret с GitHub.
 
-$AppVersion = '1.2.0'
+$AppVersion = '1.3.0'
 $AppDir     = $PSScriptRoot
 # Данные отдельно от программы: копия программы в Загрузках и установленная в zapret\autopilot видят одно и то же
 $DataDir    = Join-Path $env:ProgramData 'zapret-autopilot'
@@ -73,6 +73,70 @@ function Save-State([hashtable]$state) {
     [IO.File]::WriteAllText($StateFile, ($state | ConvertTo-Json -Depth 8), $Utf8NoBom)
 }
 
+# ================= НАСТРОЙКИ =================
+
+$SettingsFile = Join-Path $DataDir 'settings.json'
+
+function Get-DefaultSettings {
+    return [ordered]@{
+        Mode              = 'auto'                                       # auto | manual
+        InstallDir        = (Join-Path ($env:SystemDrive + '\') 'zapret')
+        DesktopShortcut   = $true
+        StartMenuShortcut = $false
+        Autostart         = $true
+        UpdatePolicy      = 'broken'                                     # never | broken | always
+        DefenderExclusion = 'ask'                                        # ask | always | never
+        ClearDiscordCache = $true
+        RemoveConflicts   = $true
+        RequiredServices  = @()                                          # пусто = все группы из targets.txt
+        SelfInstall       = $true
+    }
+}
+
+function Get-Settings {
+    $s = Get-DefaultSettings
+    if (Test-Path -LiteralPath $SettingsFile) {
+        try {
+            $obj = [IO.File]::ReadAllText($SettingsFile) | ConvertFrom-Json
+            foreach ($p in $obj.PSObject.Properties) {
+                if ($s.Contains($p.Name)) { $s[$p.Name] = $p.Value }
+            }
+            $s.RequiredServices = @($s.RequiredServices | Where-Object { $_ })
+        } catch {
+            Warn 'Файл настроек повреждён — использую стандартные настройки'
+        }
+    }
+    return $s
+}
+
+function Save-Settings($s) {
+    if (-not (Test-Path -LiteralPath $DataDir)) { New-Item -ItemType Directory -Path $DataDir | Out-Null }
+    [IO.File]::WriteAllText($SettingsFile, ($s | ConvertTo-Json -Depth 4), $Utf8NoBom)
+    $script:Settings = $s
+}
+
+function Test-AutoMode { return ($script:Settings.Mode -eq 'auto') }
+
+# В режиме АВТО вопросы не задаются — берётся ответ по умолчанию
+function Confirm-Action([string]$question, [bool]$default = $true) {
+    if (Test-AutoMode) { return $default }
+    return (Ask-YesNo $question $default)
+}
+
+# Обратный отсчёт с возможностью нажать клавишу. Возвращает нажатую клавишу (ConsoleKeyInfo) или $null.
+function Wait-Countdown([int]$seconds, [string]$template) {
+    try { while ([Console]::KeyAvailable) { [void][Console]::ReadKey($true) } } catch { return $null }
+    for ($s = $seconds; $s -gt 0; $s--) {
+        Write-Host ("`r  " + ($template -f $s) + '   ') -NoNewline -ForegroundColor Yellow
+        for ($i = 0; $i -lt 10; $i++) {
+            if ([Console]::KeyAvailable) { Write-Host ""; return [Console]::ReadKey($true) }
+            Start-Sleep -Milliseconds 100
+        }
+    }
+    Write-Host ""
+    return $null
+}
+
 # ================= ПАПКА ZAPRET =================
 
 function Test-ZapretDir([string]$dir) {
@@ -111,15 +175,33 @@ function Test-BadPath([string]$dir) {
     return $null
 }
 
-# Куда ставить zapret на чистый компьютер: C:\zapret, как советует Flowseal; если занято чужим — рядом
+# Куда ставить zapret: папка из настроек (по умолчанию C:\zapret, как советует Flowseal).
+# Если там уже лежит что-то чужое — подпапка zapret внутри неё или соседняя папка с номером.
 function Get-DefaultInstallDir {
-    $base = Join-Path ($env:SystemDrive + '\') 'zapret'
-    $candidates = @($base, "$base-discord-youtube") + @(2..9 | ForEach-Object { "$base-$_" })
+    $base = $script:Settings.InstallDir
+    if ([string]::IsNullOrWhiteSpace($base)) { $base = Join-Path ($env:SystemDrive + '\') 'zapret' }
+    $base = [IO.Path]::GetFullPath($base).TrimEnd('\')
+    $candidates = @($base, (Join-Path $base 'zapret'), "$base-discord-youtube") + @(2..9 | ForEach-Object { "$base-$_" })
     foreach ($c in $candidates) {
         if (-not (Test-Path -LiteralPath $c)) { return $c }
         if (-not (Get-ChildItem -LiteralPath $c -Force -ErrorAction SilentlyContinue | Select-Object -First 1)) { return $c }
     }
     return "$base-$(Get-Date -Format 'yyyyMMddHHmmss')"
+}
+
+# Проверка пути, который пользователь вводит в настройках. $null — путь годится.
+function Test-InstallPath([string]$path) {
+    if ([string]::IsNullOrWhiteSpace($path)) { return 'путь пустой' }
+    # Относительный путь достроился бы от C:\Windows\System32 (рабочая папка программы с правами администратора)
+    if ($path -notmatch '^[A-Za-z]:\\') { return 'нужен полный путь с буквой диска, например D:\zapret' }
+    try { $full = [IO.Path]::GetFullPath($path).TrimEnd('\') } catch { return 'это не путь к папке' }
+    if ($full.Length -le 3) { return 'нельзя ставить прямо в корень диска — укажите папку, например D:\zapret' }
+    if (-not (Test-Path -LiteralPath ($full.Substring(0, 3)))) { return "диска $($full.Substring(0, 2)) нет" }
+    $forbidden = @($env:SystemRoot, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData, $env:USERPROFILE,
+                   [Environment]::GetFolderPath('Desktop'), [Environment]::GetFolderPath('MyDocuments')) |
+                 Where-Object { $_ } | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') }
+    if ($forbidden -contains $full) { return 'это системная папка — укажите отдельную папку для zapret' }
+    return $null
 }
 
 function Get-ZapretVersion([string]$dir) {
@@ -168,8 +250,13 @@ function Resolve-ZapretDir([hashtable]$state, [switch]$ForceAsk, [switch]$NoProm
     $choice = $null
 
     if ($NoPrompt) {
+        # Папка из настроек — в первую очередь
+        $preferred = ''
+        try { $preferred = [IO.Path]::GetFullPath($script:Settings.InstallDir).TrimEnd('\') } catch {}
+        if ($preferred -and (Test-ZapretDirLoose $preferred)) { $found = @($preferred) + $found }
         if ($found.Count -eq 0) { return $null }
         $choice = @($found | Sort-Object `
+            @{ Expression = { $_ -ieq $preferred }; Descending = $true },
             @{ Expression = { (Get-ZapretProblems $_).Count -eq 0 }; Descending = $true },
             @{ Expression = { $v = Get-ZapretVersion $_; try { [version]$v } catch { [version]'0.0' } }; Descending = $true })[0]
     } elseif ($found.Count -eq 1 -and -not $ForceAsk) {
@@ -483,16 +570,24 @@ function Invoke-Diagnostics([string]$dir) {
     # Другие обходы
     $conflicts = @('GoodbyeDPI', 'discordfix_zapret', 'winws1', 'winws2' | Where-Object { Test-SvcExists $_ })
     if ($conflicts.Count) {
-        Warn "Найдены конфликтующие службы обхода: $($conflicts -join ', ') — удаляю"
-        foreach ($s in $conflicts) {
-            if (Remove-Svc $s) { Ok "Служба $s удалена" } else { Bad "Не удалось удалить службу $s" }
+        if (-not $script:Settings.RemoveConflicts) {
+            Bad "Найдены конфликтующие службы обхода: $($conflicts -join ', '). Удаление выключено в настройках — zapret может не работать"
+        } elseif (Confirm-Action "Найдены мешающие службы обхода: $($conflicts -join ', '). Удалить их?" $true) {
+            Warn "Удаляю конфликтующие службы обхода: $($conflicts -join ', ')"
+            foreach ($s in $conflicts) {
+                if (Remove-Svc $s) { Ok "Служба $s удалена" } else { Bad "Не удалось удалить службу $s" }
+            }
+            foreach ($n in 'WinDivert', 'WinDivert14') { [void](Remove-Svc $n) }
         }
-        foreach ($n in 'WinDivert', 'WinDivert14') { [void](Remove-Svc $n) }
     } else { Ok 'Других обходов (GoodbyeDPI и т.п.) не найдено' }
 
     # Кэш Discord
-    Info 'Чищу кэш Discord (Stable, PTB, Canary, Development)...'
-    Clear-DiscordCache
+    if ($script:Settings.ClearDiscordCache) {
+        Info 'Чищу кэш Discord (Stable, PTB, Canary, Development)...'
+        Clear-DiscordCache
+    } else {
+        Info 'Очистка кэша Discord выключена в настройках'
+    }
 }
 
 # ================= ТЕСТЫ =================
@@ -576,7 +671,10 @@ function Read-TestResults([string]$file, [string]$dir, $configs) {
             }
             $r.Services = @($svc.Keys | ForEach-Object { [pscustomobject]@{ Name = $_; Ok = $svc[$_].Ok; Total = $svc[$_].Total } })
             $r.ServicesOk = @($r.Services | Where-Object { $_.Ok -eq $_.Total }).Count
-            $r.Full = ($r.TargetsTotal -gt 0 -and $r.TargetsOk -eq $r.TargetsTotal)
+            # «Работает полностью» = открываются все обязательные сервисы из настроек (по умолчанию — все)
+            $required = @($r.Services | Where-Object { @($script:Settings.RequiredServices) -contains $_.Name })
+            if ($required.Count -eq 0) { $required = @($r.Services) }
+            $r.Full = ($required.Count -gt 0 -and @($required | Where-Object { $_.Ok -ne $_.Total }).Count -eq 0)
         }
         $list += [pscustomobject]$r
     }
@@ -885,7 +983,8 @@ function Get-LatestOrFail {
 
 # Возвращает 'updated' | 'latest' | 'failed'.
 # -Repair — починка повреждённой папки: ставится последняя версия, даже если она та же самая.
-function Update-Zapret([hashtable]$state, [switch]$OnlyIfNewer, [switch]$Repair) {
+# -AskFirst — в ручном режиме спросить перед обновлением (в режиме АВТО — без вопроса)
+function Update-Zapret([hashtable]$state, [switch]$OnlyIfNewer, [switch]$Repair, [switch]$AskFirst) {
     $dir = $state.ZapretDir
     $reason = Test-SafeToWipe $dir -AllowBroken:$Repair
     if ($reason) { Bad "Отказываюсь переустанавливать zapret в '$dir': $reason"; return 'failed' }
@@ -896,7 +995,11 @@ function Update-Zapret([hashtable]$state, [switch]$OnlyIfNewer, [switch]$Repair)
     $local = Get-ZapretVersion $dir
     if ($local) { Info "Установлена: $local, на GitHub: $($latest.Version)" }
     if ($OnlyIfNewer -and -not $Repair -and $local -and (Compare-Version $latest.Version $local) -le 0) {
-        Warn 'У вас уже последняя версия — переустановка тех же файлов ничего не изменит'
+        Ok 'У вас уже последняя версия zapret'
+        return 'latest'
+    }
+    if ($AskFirst -and -not (Confirm-Action "Обновить zapret с $local до $($latest.Version)? Старая версия сохранится для отката" $true)) {
+        Info 'Обновление пропущено'
         return 'latest'
     }
 
@@ -991,7 +1094,11 @@ function Add-AntivirusExclusion([string]$dir, [string[]]$missing) {
     Warn 'хотя это просто программа обхода блокировок. Без этих файлов zapret работать не может.'
 
     if (-not (Get-Command 'Add-MpPreference' -ErrorAction SilentlyContinue)) { return $false }
-    if (-not (Ask-YesNo "Добавить папку '$dir' в исключения Защитника Windows? (только эту папку)" $true)) { return $false }
+    switch ($script:Settings.DefenderExclusion) {
+        'never'  { Info 'Исключения в Защитнике выключены в настройках'; return $false }
+        'always' { Info 'Добавляю папку zapret в исключения Защитника (так задано в настройках)' }
+        default  { if (-not (Ask-YesNo "Добавить папку '$dir' в исключения Защитника Windows? (только эту папку)" $true)) { return $false } }
+    }
     try {
         Add-MpPreference -ExclusionPath $dir -ErrorAction Stop
         Ok 'Папка zapret добавлена в исключения Защитника Windows'
@@ -1016,7 +1123,9 @@ function Repair-Zapret([hashtable]$state) {
     $missing = @(Get-ZapretProblems $dir)
     if ($missing.Count -eq 0) { Ok 'Все файлы zapret на месте'; return $true }
 
-    Warn "Zapret повреждён — не хватает: $($missing -join ', '). Переустанавливаю начисто..."
+    Warn "Zapret повреждён — не хватает: $($missing -join ', ')"
+    if (-not (Confirm-Action 'Переустановить zapret начисто? Ваши списки сохранятся, старая папка — в резервной копии' $true)) { return $false }
+    Info 'Переустанавливаю начисто...'
     for ($attempt = 1; $attempt -le 2; $attempt++) {
         if ((Update-Zapret $state -Repair) -ne 'updated') { return $false }
 
@@ -1042,7 +1151,52 @@ function Get-ScriptVersion([string]$path) {
     return $null
 }
 
+# Куда кладутся ярлыки — отдельной функцией, чтобы их можно было подменить в тестах
+function Get-ShortcutPath([string]$where) {
+    if ($where -eq 'desktop') { return Join-Path ([Environment]::GetFolderPath('Desktop')) 'Zapret.lnk' }
+    return Join-Path ([Environment]::GetFolderPath('Programs')) 'Zapret.lnk'
+}
+
+# Ярлык «Zapret» на рабочем столе и в меню «Пуск» — по настройкам; выключенный ярлык удаляется
+# (только если это наш ярлык, чужой файл с таким именем не трогаем)
+function Update-Shortcuts([string]$launcher) {
+    $shell = New-Object -ComObject WScript.Shell
+    $places = @(
+        @{ Where = 'desktop';   On = [bool]$script:Settings.DesktopShortcut;   Name = 'на рабочем столе' },
+        @{ Where = 'startmenu'; On = [bool]$script:Settings.StartMenuShortcut; Name = 'в меню «Пуск»' }
+    )
+    foreach ($p in $places) {
+        $lnkPath = Get-ShortcutPath $p.Where
+        try {
+            $existing = $null
+            if (Test-Path -LiteralPath $lnkPath) { $existing = $shell.CreateShortcut($lnkPath).TargetPath }
+            if (-not $p.On) {
+                if ($existing -and $existing -like '*zapret-autopilot.bat') {
+                    Remove-Item -LiteralPath $lnkPath -Force -ErrorAction Stop
+                    Ok "Ярлык $($p.Name) убран"
+                }
+                continue
+            }
+            if (-not $launcher -or $existing -ieq $launcher) { continue }
+            $lnk = $shell.CreateShortcut($lnkPath)
+            $lnk.TargetPath = $launcher
+            $lnk.WorkingDirectory = Split-Path $launcher -Parent
+            $lnk.Description = 'Zapret: включить, выключить или починить обход блокировок'
+            $lnk.IconLocation = "$env:SystemRoot\System32\shell32.dll,13"
+            $lnk.Save()
+            Ok "Ярлык «Zapret» $($p.Name) — через него программа открывается в следующий раз"
+        } catch {
+            Warn "Не удалось обновить ярлык $($p.Name): $($_.Exception.Message)"
+        }
+    }
+}
+
+# Копия программы в <zapret>\autopilot (если включено) и ярлыки на неё
 function Install-Self([string]$dir) {
+    if (-not $script:Settings.SelfInstall) {
+        Update-Shortcuts (Join-Path $AppDir 'zapret-autopilot.bat')
+        return
+    }
     $target = Join-Path $dir 'autopilot'
     if ($AppDir.TrimEnd('\') -ine $target) {
         $installed = Get-ScriptVersion (Join-Path $target 'autopilot.ps1')
@@ -1064,24 +1218,63 @@ function Install-Self([string]$dir) {
     }
 
     $launcher = Join-Path $target 'zapret-autopilot.bat'
-    if (-not (Test-Path -LiteralPath $launcher)) { return }
-    try {
-        $lnkPath = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Zapret.lnk'
-        $shell = New-Object -ComObject WScript.Shell
-        $existing = $null
-        if (Test-Path -LiteralPath $lnkPath) { $existing = $shell.CreateShortcut($lnkPath).TargetPath }
-        if ($existing -ine $launcher) {
-            $lnk = $shell.CreateShortcut($lnkPath)
-            $lnk.TargetPath = $launcher
-            $lnk.WorkingDirectory = $target
-            $lnk.Description = 'Zapret: включить, выключить или починить обход блокировок'
-            $lnk.IconLocation = "$env:SystemRoot\System32\shell32.dll,13"
-            $lnk.Save()
-            Ok 'На рабочем столе появился ярлык «Zapret» — через него программа открывается в следующий раз'
-        }
-    } catch {
-        Warn "Не удалось создать ярлык на рабочем столе: $($_.Exception.Message)"
+    if (-not (Test-Path -LiteralPath $launcher)) { $launcher = Join-Path $AppDir 'zapret-autopilot.bat' }
+    Update-Shortcuts $launcher
+}
+
+# Где сейчас лежит программа, на которую стоит смотреть ярлыкам
+function Get-InstalledLauncher([hashtable]$state) {
+    if ($script:Settings.SelfInstall -and $state.ZapretDir) {
+        $l = Join-Path $state.ZapretDir 'autopilot\zapret-autopilot.bat'
+        if (Test-Path -LiteralPath $l) { return $l }
     }
+    return Join-Path $AppDir 'zapret-autopilot.bat'
+}
+
+# Перенос установленного zapret в другую папку (смена пути в настройках).
+# Копируется всё, включая bin и autopilot; потом переключаются автозапуск и ярлыки, старая папка удаляется.
+function Move-Zapret([hashtable]$state, [string]$newDir) {
+    $old = $state.ZapretDir
+    $newDir = [IO.Path]::GetFullPath($newDir).TrimEnd('\')
+    if ($old -ieq $newDir) { return $true }
+    if ($newDir.StartsWith($old + '\', [StringComparison]::OrdinalIgnoreCase)) { Bad 'Новая папка не может лежать внутри старой'; return $false }
+    if ((Test-Path -LiteralPath $newDir) -and (Get-ChildItem -LiteralPath $newDir -Force | Select-Object -First 1)) {
+        Bad "Папка $newDir не пустая — выберите пустую или новую папку"
+        return $false
+    }
+    $reason = Test-SafeToWipe $old -AllowBroken
+    if ($reason) { Bad "Не трогаю старую папку '$old': $reason"; return $false }
+
+    $autoWasOn = [bool](Get-AutostartBat)
+    Stop-Bypass
+    Info "Переношу zapret: $old -> $newDir"
+    try {
+        New-Item -ItemType Directory -Path $newDir -Force | Out-Null
+        Get-ChildItem -LiteralPath $old -Force | Copy-Item -Destination $newDir -Recurse -Force -ErrorAction Stop
+    } catch {
+        Bad "Не удалось скопировать: $($_.Exception.Message). zapret остался в старой папке"
+        return $false
+    }
+    if (-not (Test-ZapretDir $newDir)) { Bad 'После копирования в новой папке нет нужных файлов — zapret остался в старой'; return $false }
+
+    $state.ZapretDir = $newDir
+    Save-State $state
+    Ok "zapret перенесён в $newDir"
+
+    if ($autoWasOn -and $state.BestConfig) { [void](Enable-Autostart (Join-Path $newDir $state.BestConfig)) }
+    Install-Self $newDir
+
+    # Старая папка: удаляется целиком, кроме программы, если она запущена прямо оттуда
+    $keepRunning = $null
+    if ($AppDir.StartsWith($old + '\', [StringComparison]::OrdinalIgnoreCase)) { $keepRunning = $AppDir.Substring($old.Length + 1).Split('\')[0] }
+    Get-ChildItem -LiteralPath $old -Force | Where-Object { $_.Name -ne $keepRunning } |
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    if (-not $keepRunning) { Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue }
+    if (Test-Path -LiteralPath $old) { Info "Старую папку $old можно удалить вручную после закрытия программы" }
+    else { Ok 'Старая папка удалена' }
+
+    if ($state.BestConfig) { [void](Start-Strategy $newDir $state.BestConfig) }
+    return $true
 }
 
 # Откат: вернуть zapret из резервной копии вместе с лучшей стратегией и автозапуском того времени.
@@ -1188,16 +1381,15 @@ function Restore-Zapret([hashtable]$state) {
 
 # ================= ЦИКЛ =================
 
-# -Auto — не спрашивать: автозапуск включается сразу (для автоматического режима)
-function Sync-Autostart([string]$batPath, [bool]$offerDefault, [switch]$Auto) {
-    if (Get-AutostartTask) {
-        if ((Get-AutostartBat) -ieq $batPath) {
-            Ok 'Автозапуск уже настроен на эту стратегию'
-        } else {
-            Info 'Автозапуск включён на другую стратегию — переключаю на новую лучшую'
-            [void](Enable-Autostart $batPath)
-        }
-    } elseif ($Auto -or (Ask-YesNo "Поставить $(Split-Path $batPath -Leaf) на автозапуск вместе с Windows (свёрнуто)?" $offerDefault)) {
+# Автозапуск приводится к настройке «Включать обход при запуске Windows»
+function Sync-Autostart([string]$batPath) {
+    if (-not $script:Settings.Autostart) {
+        if (Get-AutostartTask) { Info 'Автозапуск выключен в настройках — убираю задачу'; Disable-Autostart }
+        return
+    }
+    if ((Get-AutostartBat) -ieq $batPath) {
+        Ok 'Автозапуск уже настроен на эту стратегию'
+    } else {
         [void](Enable-Autostart $batPath)
     }
 }
@@ -1228,7 +1420,7 @@ function Invoke-Cycle([hashtable]$state, [switch]$SkipDiagnostics, [switch]$NoUp
             $state.LastRun = (Get-Date -Format 'yyyy-MM-dd HH:mm')
             $state.Results = @()
             Save-State $state
-            if (Start-Strategy $dir $fallback) { Sync-Autostart (Join-Path $dir $fallback) $false -Auto }
+            if (Start-Strategy $dir $fallback) { Sync-Autostart (Join-Path $dir $fallback) }
         }
         return
     }
@@ -1249,10 +1441,13 @@ function Invoke-Cycle([hashtable]$state, [switch]$SkipDiagnostics, [switch]$NoUp
     Show-Results $results
 
     if (-not $best.Full) {
-        Warn 'Ни одна стратегия не открывает все сервисы одновременно'
-        if (-not $NoUpdate) {
+        Warn 'Ни одна стратегия не открывает все нужные сервисы одновременно'
+        if ($NoUpdate) {
+        } elseif ($script:Settings.UpdatePolicy -eq 'never') {
+            Info 'Обновление zapret выключено в настройках'
+        } else {
             Step 'Обновление zapret с GitHub'
-            if ((Update-Zapret $state -OnlyIfNewer) -eq 'updated') {
+            if ((Update-Zapret $state -OnlyIfNewer -AskFirst) -eq 'updated') {
                 Info 'Повторяю проверку на новой версии...'
                 Invoke-Cycle $state -NoUpdate -Auto:$Auto
                 if (-not $Auto) {
@@ -1274,7 +1469,7 @@ function Invoke-Cycle([hashtable]$state, [switch]$SkipDiagnostics, [switch]$NoUp
     else { Warn "Лучшая из имеющихся: $($best.Config) — не открываются: $($best.Failed -join ', ')" }
 
     if (Start-Strategy $dir $best.Config) {
-        Sync-Autostart (Join-Path $dir $best.Config) ([bool]$best.Full) -Auto:$Auto
+        Sync-Autostart (Join-Path $dir $best.Config)
     }
     if ($script:DiscordWasClosed -and -not $Auto) { Info 'Discord был закрыт для очистки кэша — запустите его заново' }
 }
@@ -1288,6 +1483,8 @@ function Invoke-AutoSetup([hashtable]$state) {
     Step 'Ищу zapret на компьютере'
     $dir = Resolve-ZapretDir $state -NoPrompt
     if (-not $dir) {
+        $target = Get-DefaultInstallDir
+        if (-not (Confirm-Action "zapret на компьютере не найден. Установить последнюю версию в $target ?" $true)) { return }
         Info 'zapret на компьютере нет — устанавливаю последнюю версию'
         if (-not (Install-ZapretFresh $state)) { return }
     } else {
@@ -1299,6 +1496,11 @@ function Invoke-AutoSetup([hashtable]$state) {
 
     Step 'Проверяю, что все файлы zapret на месте'
     if (-not (Repair-Zapret $state)) { return }
+
+    if ($script:Settings.UpdatePolicy -eq 'always') {
+        Step 'Проверяю обновления zapret (в настройках: всегда последняя версия)'
+        [void](Update-Zapret $state -OnlyIfNewer -AskFirst)
+    }
     Install-Self $state.ZapretDir
 
     Invoke-Cycle $state -Auto
@@ -1307,12 +1509,14 @@ function Invoke-AutoSetup([hashtable]$state) {
     if (-not $state.BestConfig) {
         $missing = @(Get-ZapretProblems $state.ZapretDir)
         $badPath = Test-BadPath $state.ZapretDir
+        $cleanDir = Get-DefaultInstallDir
         if ($missing.Count) {
             # Файлы пропали уже во время проверки — тоже антивирус
             Step 'Файлы zapret пропали во время проверки — чиню'
             if (Repair-Zapret $state) { Invoke-Cycle $state -Auto -NoUpdate }
-        } elseif ($badPath) {
-            Step "Zapret лежит в неудачном месте ($badPath) — ставлю чистую копию в C:\"
+        } elseif ($badPath -and -not (Test-BadPath $cleanDir) -and
+                  (Confirm-Action "zapret лежит в неудачном месте ($badPath). Поставить чистую копию в $cleanDir ?" $true)) {
+            Step "Zapret лежит в неудачном месте ($badPath) — ставлю чистую копию в $cleanDir"
             if (Install-ZapretFresh $state) {
                 if (Repair-Zapret $state) {
                     Install-Self $state.ZapretDir
@@ -1356,7 +1560,11 @@ function Show-Summary([hashtable]$state) {
     Write-Host ""
     if (Get-AutostartBat) { Say '  Обход будет включаться сам при каждом запуске компьютера.' Gray }
     Say '  На панели задач будет свёрнутое окно «zapret» — не закрывайте его, это и есть обход.' Gray
-    Say '  Если что-то перестанет работать — откройте ярлык «Zapret» на рабочем столе и выберите «Починить».' Gray
+    $where = @()
+    if ($script:Settings.DesktopShortcut) { $where += 'на рабочем столе' }
+    if ($script:Settings.StartMenuShortcut) { $where += 'в меню «Пуск»' }
+    if ($where.Count) { Say "  Если что-то перестанет работать — откройте ярлык «Zapret» $($where -join ' или ') и выберите «Починить»." Gray }
+    else { Say "  Если что-то перестанет работать — запустите $(Get-InstalledLauncher $state) и выберите «Починить»." Gray }
     if ($script:DiscordWasClosed) {
         Write-Host ""
         Say '  Discord был закрыт, чтобы очистить его кэш, — откройте его заново.' Cyan
@@ -1371,7 +1579,42 @@ function Test-Ready([hashtable]$state) {
                   (Test-Path -LiteralPath (Join-Path $state.ZapretDir $state.BestConfig)))
 }
 
+# Режим АВТО при открытии программы: сам настраивает или сам включает обход и закрывается.
+# Нажатая во время отсчёта клавиша — остаться в меню. $true — программу можно закрывать.
+function Invoke-AutoOnOpen([hashtable]$state) {
+    Say '  Режим АВТО' Cyan
+    if (-not (Test-Ready $state)) {
+        if (-not $state.ZapretDir) {
+            Say '  Сейчас программа сама найдёт или установит zapret, подберёт лучшую настройку' Gray
+            Say '  и включит обход. Это займёт 5–10 минут, Discord будет закрыт.' Gray
+        } else {
+            Say '  Zapret нужно починить или заново настроить — программа сделает это сама (5–10 минут).' Gray
+        }
+        Write-Host ""
+        Say '  [Enter] — начать сразу    5 — настройки    9 — меню для опытных    0 — выход' DarkGray
+        $key = Wait-Countdown 10 'Начну через {0} с.'
+        if ($key) {
+            switch ($key.KeyChar) {
+                '0' { return $true }
+                '5' { Show-Settings $state; return $false }
+                '9' { Show-Menu; return $false }
+            }
+            if ($key.Key -eq 'Escape') { return $true }
+        }
+        Invoke-AutoSetup $state
+    } elseif (-not (Test-WinwsRunning)) {
+        [void](Invoke-StartBest $state)
+    } else {
+        return $false   # уже работает — человек открыл программу, чтобы что-то сделать
+    }
+    Write-Host ""
+    Say '  Нажмите любую клавишу, чтобы открыть меню' DarkGray
+    $key = Wait-Countdown 15 'Окно закроется через {0} с.'
+    return (-not $key)
+}
+
 function Show-Home {
+    $first = $true
     while ($true) {
         $state = Get-State
         Clear-Host
@@ -1379,6 +1622,13 @@ function Show-Home {
         Say '  ZAPRET — обход блокировок Discord и YouTube' White
         Say '  ---------------------------------------------' DarkGray
         Write-Host ""
+
+        if ($first -and (Test-AutoMode)) {
+            $first = $false
+            if (Invoke-AutoOnOpen $state) { return }
+            continue
+        }
+        $first = $false
 
         # Первый запуск, поломка или настройка не подобрана — предлагаем сделать всё одной кнопкой
         if (-not (Test-Ready $state)) {
@@ -1396,12 +1646,14 @@ function Show-Home {
             Say '  пропадать, а Discord будет закрыт — это нормально.' Gray
             Write-Host ""
             Say '  [Enter]  Начать' Green
+            Say '     5     Настройки (папка установки, ярлыки, режим АВТО...)' Gray
             Say '     9     Меню для опытных' DarkGray
             Say '     0     Выход' DarkGray
             Write-Host ""
             $choice = Read-Host '  Ваш выбор'
             switch ($choice) {
                 '0' { return }
+                '5' { Show-Settings $state }
                 '9' { Show-Menu }
                 default { Invoke-AutoSetup $state; Wait-AnyKey }
             }
@@ -1434,6 +1686,7 @@ function Show-Home {
         Say '     3     Что-то не работает? Починить и настроить заново' Gray
         if ($autoOn) { Say '     4     Не включать обход при запуске компьютера' Gray }
         else { Say '     4     Включать обход сам при запуске компьютера' Gray }
+        Say '     5     Настройки (папка установки, ярлыки, режим АВТО...)' Gray
         Say '     9     Меню для опытных' DarkGray
         Say '     0     Выход' DarkGray
         Write-Host ""
@@ -1455,12 +1708,168 @@ function Show-Home {
             '2' { Stop-Bypass -KeepService; Ok 'Обход выключен'; Start-Sleep -Seconds 1 }
             '3' { Invoke-AutoSetup $state; Wait-AnyKey }
             '4' {
-                if ($autoOn) { Disable-Autostart }
-                else { [void](Enable-Autostart (Join-Path $state.ZapretDir $state.BestConfig)) }
+                $script:Settings.Autostart = -not $autoOn
+                Save-Settings $script:Settings
+                Sync-Autostart (Join-Path $state.ZapretDir $state.BestConfig)
                 Start-Sleep -Seconds 2
             }
+            '5' { Show-Settings $state }
             '9' { Show-Menu }
             '0' { return }
+        }
+    }
+}
+
+# ================= ЭКРАН НАСТРОЕК =================
+
+function Format-YesNo($v) { if ($v) { return 'да' } return 'нет' }
+
+# Группы сервисов в порядке utils\targets.txt (Discord, YouTube, Google, Cloudflare...)
+function Get-ServiceGroups([string]$dir) {
+    $file = $null
+    if ($dir) { $file = Join-Path $dir 'utils\targets.txt' }
+    if (-not $file -or -not (Test-Path -LiteralPath $file)) { return @('Discord', 'YouTube', 'Google', 'Cloudflare') }
+    $groups = New-Object System.Collections.Generic.List[string]
+    $group = $null
+    foreach ($line in [IO.File]::ReadAllLines($file)) {
+        if ($line -match '^\s*###\s*(.+?)\s*$') { $group = ($matches[1] -replace '\s*\(.*\)$', ''); continue }
+        if ($group -and $line -match '^\s*\w+\s*=\s*"https?://' -and -not $groups.Contains($group)) { $groups.Add($group) }
+    }
+    if ($groups.Count -eq 0) { return @('Discord', 'YouTube', 'Google', 'Cloudflare') }
+    return $groups.ToArray()
+}
+
+function Edit-RequiredServices([hashtable]$state) {
+    $all = @(Get-ServiceGroups $state.ZapretDir)
+    $chosen = New-Object System.Collections.Generic.List[string]
+    foreach ($g in @($script:Settings.RequiredServices)) { if ($all -contains $g) { $chosen.Add($g) } }
+    while ($true) {
+        Write-Host ""
+        Say '  Какие сервисы обязательно должны работать? Если ни одна настройка не открывает их все,' Gray
+        Say '  программа попробует обновить zapret. Остальные сервисы тоже проверяются, но не обязательны.' Gray
+        for ($i = 0; $i -lt $all.Count; $i++) {
+            $mark = ' '
+            if ($chosen.Count -eq 0 -or $chosen.Contains($all[$i])) { $mark = 'x' }
+            Say "    $($i + 1). [$mark] $($all[$i])" Gray
+        }
+        $in = Read-Host '  Номер — включить/выключить, A — все, Enter — готово'
+        if ([string]::IsNullOrWhiteSpace($in)) { break }
+        $in = $in.Trim()
+        if ($in -match '^[aAаА]$') { $chosen.Clear(); continue }
+        if ($in -match '^\d+$' -and [int]$in -ge 1 -and [int]$in -le $all.Count) {
+            $g = $all[[int]$in - 1]
+            if ($chosen.Count -eq 0) { foreach ($x in $all) { $chosen.Add($x) } }   # «все» -> явный список
+            if ($chosen.Contains($g)) {
+                # Пустой список означает «все», поэтому последний снять нельзя
+                if ($chosen.Count -eq 1) { Warn 'Хотя бы один сервис должен быть обязательным' }
+                else { [void]$chosen.Remove($g) }
+            } else {
+                $chosen.Add($g)
+            }
+            if ($chosen.Count -eq $all.Count) { $chosen.Clear() }
+        }
+    }
+    $script:Settings.RequiredServices = @($chosen)
+    Save-Settings $script:Settings
+}
+
+function Edit-InstallDir([hashtable]$state) {
+    Write-Host ""
+    Say "  Сейчас: $($script:Settings.InstallDir)" Gray
+    Say '  Совет: короткий путь без русских букв, например C:\zapret или D:\Programs\zapret' DarkGray
+    $in = Read-Host '  Новая папка для zapret (Enter — оставить как есть)'
+    if ([string]::IsNullOrWhiteSpace($in)) { return }
+    $path = $in.Trim().Trim('"')
+    $err = Test-InstallPath $path
+    if ($err) { Bad "Не подходит: $err"; Wait-AnyKey; return }
+    $path = [IO.Path]::GetFullPath($path).TrimEnd('\')
+    $bad = Test-BadPath $path
+    if ($bad -and -not (Ask-YesNo "В этом пути проблема ($bad) — zapret там часто не работает. Всё равно выбрать?" $false)) { return }
+
+    $script:Settings.InstallDir = $path
+    Save-Settings $script:Settings
+    Ok "Папка установки: $path"
+
+    if ($state.ZapretDir -and (Test-ZapretDirLoose $state.ZapretDir) -and $state.ZapretDir -ine $path) {
+        if (Ask-YesNo "zapret сейчас установлен в $($state.ZapretDir). Перенести его в $path ?" $true) {
+            [void](Move-Zapret $state $path)
+        } else {
+            Info 'Хорошо, установленный zapret остаётся на месте. Новая папка будет использована при следующей чистой установке'
+        }
+    }
+    Wait-AnyKey
+}
+
+function Show-Settings([hashtable]$state) {
+    $updNames = @{ never = 'никогда'; broken = 'только если перестал работать'; always = 'всегда ставить последнюю версию' }
+    $defNames = @{ ask = 'спрашивать'; always = 'добавлять без вопроса'; never = 'никогда не добавлять' }
+    while ($true) {
+        $s = $script:Settings
+        Clear-Host
+        Write-Host ""
+        Say '  НАСТРОЙКИ' White
+        Say '  ---------------------------------------------' DarkGray
+        Write-Host ""
+        $modeText = 'РУЧНОЙ — показывает меню и спрашивает перед изменениями'
+        if ($s.Mode -eq 'auto') { $modeText = 'АВТО — при открытии сам всё делает, без вопросов' }
+        $req = 'все'
+        if (@($s.RequiredServices).Count) { $req = @($s.RequiredServices) -join ', ' }
+
+        $rows = @(
+            @('1',  'Режим работы',                              $modeText),
+            @('2',  'Папка для установки zapret',                $s.InstallDir),
+            @('3',  'Ярлык на рабочем столе',                    (Format-YesNo $s.DesktopShortcut)),
+            @('4',  'Ярлык в меню «Пуск»',                       (Format-YesNo $s.StartMenuShortcut)),
+            @('5',  'Включать обход при запуске Windows',        (Format-YesNo $s.Autostart)),
+            @('6',  'Обновлять zapret',                          $updNames[$s.UpdatePolicy]),
+            @('7',  'Исключение в Защитнике Windows',            $defNames[$s.DefenderExclusion]),
+            @('8',  'Чистить кэш Discord при настройке',         (Format-YesNo $s.ClearDiscordCache)),
+            @('9',  'Удалять мешающие программы (GoodbyeDPI…)',  (Format-YesNo $s.RemoveConflicts)),
+            @('10', 'Обязательные сервисы',                      $req),
+            @('11', 'Копировать программу в папку zapret',       (Format-YesNo $s.SelfInstall))
+        )
+        foreach ($r in $rows) { Say ('  {0,4}   {1,-44} {2}' -f $r[0], $r[1], $r[2]) Gray }
+        Write-Host ""
+        if ($state.ZapretDir) { Say "  zapret сейчас установлен в: $($state.ZapretDir)" DarkGray }
+        Say '     R   Вернуть стандартные настройки' DarkGray
+        Say '     0   Назад (всё сохраняется сразу)' DarkGray
+        Write-Host ""
+        $c = Read-Host '  Что изменить'
+        if ([string]::IsNullOrWhiteSpace($c)) { $c = '0' }
+        $launcherChanged = $false
+
+        switch ($c.Trim().ToUpperInvariant()) {
+            '0'  { return }
+            '1'  { if ($s.Mode -eq 'auto') { $s.Mode = 'manual' } else { $s.Mode = 'auto' } }
+            '2'  { Edit-InstallDir $state; continue }
+            '3'  { $s.DesktopShortcut = -not $s.DesktopShortcut; $launcherChanged = $true }
+            '4'  { $s.StartMenuShortcut = -not $s.StartMenuShortcut; $launcherChanged = $true }
+            '5'  { $s.Autostart = -not $s.Autostart }
+            '6'  { $s.UpdatePolicy = @{ never = 'broken'; broken = 'always'; always = 'never' }[$s.UpdatePolicy] }
+            '7'  { $s.DefenderExclusion = @{ ask = 'always'; always = 'never'; never = 'ask' }[$s.DefenderExclusion] }
+            '8'  { $s.ClearDiscordCache = -not $s.ClearDiscordCache }
+            '9'  { $s.RemoveConflicts = -not $s.RemoveConflicts }
+            '10' { Edit-RequiredServices $state; continue }
+            '11' { $s.SelfInstall = -not $s.SelfInstall; $launcherChanged = $true }
+            { $_ -eq 'R' -or $_ -eq 'К' } {
+                if (Ask-YesNo 'Вернуть все настройки к стандартным?' $false) {
+                    $s = Get-DefaultSettings
+                    $launcherChanged = $true
+                    $c = '5'   # автозапуск тоже привести к стандарту
+                }
+            }
+        }
+        Save-Settings $s
+
+        # Применяем сразу то, что видно в системе
+        if ($launcherChanged) {
+            if ($s.SelfInstall -and $state.ZapretDir -and (Test-ZapretDirLoose $state.ZapretDir)) { Install-Self $state.ZapretDir }
+            else { Update-Shortcuts (Get-InstalledLauncher $state) }
+            Start-Sleep -Seconds 1
+        }
+        if ($c.Trim() -eq '5' -and $state.BestConfig -and $state.ZapretDir) {
+            Sync-Autostart (Join-Path $state.ZapretDir $state.BestConfig)
+            Start-Sleep -Seconds 1
         }
     }
 }
@@ -1521,11 +1930,12 @@ function Show-Menu {
         if ($backupCount) { Say "     10. Откатить обновление (резервных копий: $backupCount)" Gray }
         else { Say '     10. Откатить обновление (копий пока нет)' DarkGray }
         Say '     11. Выбрать другую папку zapret' Gray
+        Say '     12. Настройки (режим АВТО, папка установки, ярлыки...)' Gray
         Write-Host ""
         Say '  ----------------------------------------' DarkGray
         Say '     0. Назад' Gray
         Write-Host ""
-        $choice = Read-Host '  Выберите пункт (0-11)'
+        $choice = Read-Host '  Выберите пункт (0-12)'
 
         switch ($choice) {
             '1' { Invoke-Cycle $state; Wait-AnyKey }
@@ -1557,6 +1967,7 @@ function Show-Menu {
             }
             '10' { Step 'Откат обновления zapret'; [void](Restore-Zapret $state); Wait-AnyKey }
             '11' { [void](Resolve-ZapretDir $state -ForceAsk); Wait-AnyKey }
+            '12' { Show-Settings $state }
             '0' { return }
         }
     }
@@ -1595,11 +2006,14 @@ if ($Action -notin 'start', 'stop') {
 }
 
 try {
+    $script:Settings = Get-Settings
     $state = Get-State
     switch ($Action.ToLowerInvariant()) {
         'home'  { Show-Home }
         'menu'  { Show-Menu }
-        'auto'  { Invoke-AutoSetup $state; Wait-AnyKey }
+        'settings' { Show-Settings $state }
+        # Команда auto — всегда без вопросов, даже если в настройках выбран ручной режим
+        'auto'  { $script:Settings.Mode = 'auto'; Invoke-AutoSetup $state; Wait-AnyKey }
         'cycle' { Invoke-Cycle $state; Wait-AnyKey }
         'test'  { Invoke-Cycle $state -SkipDiagnostics -NoUpdate; Wait-AnyKey }
         'diag'  {
@@ -1612,7 +2026,7 @@ try {
         }
         'stop'  { Stop-Bypass -KeepService; Ok 'Обход остановлен'; Start-Sleep -Seconds 2 }
         'rollback' { Step 'Откат обновления zapret'; [void](Restore-Zapret $state); Wait-AnyKey }
-        default { Bad "Неизвестная команда '$Action'. Доступны: auto, menu, cycle, start, stop, diag, test, rollback"; Wait-AnyKey }
+        default { Bad "Неизвестная команда '$Action'. Доступны: auto, menu, settings, cycle, start, stop, diag, test, rollback"; Wait-AnyKey }
     }
 } finally {
     if ($logged) { try { Stop-Transcript | Out-Null } catch {} }
